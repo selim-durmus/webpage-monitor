@@ -1,9 +1,13 @@
-// Import necessary modules
 const puppeteer = require('puppeteer');
+const jsdom = require('jsdom');
 const nodemailer = require('nodemailer');
 require('dotenv').config();
 
-// Setting up email transporter using environment variables
+const { JSDOM } = jsdom;
+const SITE_URL = process.env.SITE_URL;
+const PRODUCT_SELECTOR = process.env.PRODUCT_SELECTOR;
+const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL, 10);
+
 const transporter = nodemailer.createTransport({
   service: process.env.MAIL_SERVICE,
   auth: {
@@ -12,77 +16,74 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-// Function to send an email notification
-async function sendEmailNotification(subject, text) {
-  const mailOptions = {
-    from: process.env.MAIL_USER,
-    to: process.env.MAIL_TO,
-    subject: subject,
-    text: text,
-  };
+const COLORS = {
+  reset: '\x1b[0m', red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m',
+  blue: '\x1b[34m', magenta: '\x1b[35m', cyan: '\x1b[36m', white: '\x1b[37m',
+};
 
+let lastCheckedContents = {};
+
+console.log(process.env.INITIAL_MSG);
+
+async function checkPage() {
   try {
-    await transporter.sendMail(mailOptions);
-    console.log('Notification email sent!');
+    const browser = await puppeteer.launch({
+      headless: "new",
+      args: ['--disable-cache', '--disk-cache-size=0', '--no-sandbox', '--disable-background-networking'],
+    });
+
+    const page = await browser.newPage();
+    await page.goto(SITE_URL, { waitUntil: 'domcontentloaded' });
+
+    const pageContent = await page.content();
+    await browser.close();  // Close browser after every check
+
+    const dom = new JSDOM(pageContent);
+    const elements = dom.window.document.querySelectorAll(PRODUCT_SELECTOR);
+
+    for (const element of elements) {
+      const availabilityStatus = element.textContent.trim();
+      const productUrl = element.closest('a') ? element.closest('a').href : 'unknown product';
+
+      console.log(`${COLORS.cyan}Product URL: ${productUrl}${COLORS.reset}`);
+      console.log(availabilityStatus === "Not Available for Order"
+        ? `${COLORS.red}Availability status: "${availabilityStatus}"${COLORS.reset}`
+        : `${COLORS.green}Availability status: "${availabilityStatus}"${COLORS.reset}`
+      );
+
+      if (!lastCheckedContents[productUrl]) {
+        lastCheckedContents[productUrl] = availabilityStatus;
+        console.log(`${COLORS.yellow}No availability changes detected for this product. Monitoring continues...${COLORS.reset}\n`);
+        continue;
+      }
+
+      if (availabilityStatus !== lastCheckedContents[productUrl]) {
+        console.log(`${COLORS.magenta}Change detected for ${productUrl}: "${availabilityStatus}"${COLORS.reset}`);
+        lastCheckedContents[productUrl] = availabilityStatus;
+        await sendEmailNotification(productUrl, availabilityStatus);
+      } else {
+        console.log(`${COLORS.yellow}No availability changes detected for this product. Monitoring continues...${COLORS.reset}\n`);
+      }
+    }
   } catch (error) {
-    console.error('Error sending email:', error);
+    console.error(`${COLORS.red}Error fetching or processing the page:${COLORS.reset} ${error.message}`);
   }
 }
 
-// Function to monitor page changes
-async function monitorPageChanges(page) {
-  let previousContent = '';
-  let firstCheckDone = false;
-
-  // Initial page check
-  console.log(process.env.INITIAL_MSG);
-
-  setInterval(async () => {
-    // Wait for the product container to load (with a timeout for safety)
-    await page.waitForSelector(process.env.PRODUCT_SELECTOR, { timeout: 15000 });
-
-    // Extract and clean up the current content from the product container
-    const currentContent = await page.$eval(process.env.PRODUCT_SELECTOR, (el) => el.innerText.trim().replace(/\s+/g, ' '));
-
-    // Output the text that's been checked
-    console.log(`Checked content: "${currentContent}"`);
-
-    // Skip email notifications on the first check to prevent false positives
-    if (!firstCheckDone) {
-      firstCheckDone = true;
-      previousContent = currentContent;
-      console.log("First check complete. Monitoring for further changes.");
-      return;  // Skip sending email on the first check
-    }
-
-    // Only send a notification if the content is significantly different
-    if (currentContent !== previousContent) {
-      console.log(process.env.CHANGE_DETECTED_MSG);
-
-      // Check if the availability check message exists in the content
-      if (currentContent.includes(process.env.AVAILABILITY_CHECK_TEXT)) {
-        console.log(`Product status: "${currentContent}"`);
-        await sendEmailNotification('Product availability change detected', `Product status changed to: "${currentContent}"`);
-      } else {
-        console.log(process.env.NO_CHANGE_MSG);
-      }
-
-      // Update the previous content for future checks
-      previousContent = currentContent;
-    } else {
-      console.log('No content change detected.');
-    }
-  }, process.env.CHECK_INTERVAL);
+async function sendEmailNotification(productUrl, content) {
+  try {
+    await transporter.sendMail({
+      from: process.env.MAIL_USER,
+      to: process.env.MAIL_TO,
+      subject: "Availability Update Detected!",
+      text: `Detected new availability for product: ${productUrl}\nStatus: "${content}"`,
+    });
+    console.log("Notification email sent!");
+  } catch (error) {
+    console.error("Error sending email:", error.message);
+  }
 }
 
-// Open browser, navigate to the page, and start monitoring
-async function testProductAvailability() {
-  const browser = await puppeteer.launch({ headless: true });
-  const page = await browser.newPage();
-  await page.goto(process.env.SITE_URL);
-
-  // Start monitoring the page for changes
-  await monitorPageChanges(page);
-}
-
-testProductAvailability();
+// Run the check at the defined interval
+setInterval(checkPage, CHECK_INTERVAL);
+checkPage();
